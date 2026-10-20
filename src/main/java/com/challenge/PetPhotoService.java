@@ -1,105 +1,117 @@
 package com.challenge;
 
-import org.springframework.core.io.ClassPathResource;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
-import org.springframework.util.FileCopyUtils;
-
-import jakarta.annotation.PostConstruct;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
-import java.util.Random;
+import java.util.Optional;
+import java.util.concurrent.ThreadLocalRandom;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.client.RestClientException;
+import org.springframework.web.client.RestTemplate;
 
-@Service 
+@Service
 public class PetPhotoService {
-    private final JdbcTemplate jdbcTemplate;
-    private final RestTemplate restTemplate = new RestTemplate();
 
-    // Candidate URLs based on your requirements and public-apis animal recommendations
-    private final List<String> candidateUrls = List.of(
-        "https://place.dog/300/200",
-        "https://placebear.com/400/400",
-        "https://picsum.photos/400/400" // Fallback alternative from public-apis ecosystem
-    );
-    private final String SCHEMA_FILE = "schema.sql";
-    private final String UPDATE_SQL = "INSERT INTO fetched_photos (image_binary, timestamp, source_website) VALUES (?, ?, ?)";
-    private final String SELECT_SQL = "SELECT timestamp, source_website, image_binary FROM fetched_photos ORDER BY id DESC LIMIT 1";
+    private static final Logger log = LoggerFactory.getLogger(PetPhotoService.class);
+
+    private static final int MIN_SIZE = 200;
+    private static final int MAX_SIZE = 600;
+    private static final String INSERT_SQL =
+            "INSERT INTO fetched_photos (animal_type, image_binary, content_type, timestamp, source_website) VALUES (?, ?, ?, ?, ?)";
+    private static final String SELECT_COLUMNS =
+            "SELECT id, animal_type, image_binary, content_type, timestamp, source_website FROM fetched_photos ";
+    private static final RowMapper<Photo> PHOTO_MAPPER = (rs, rowNum) -> new Photo(
+            rs.getLong("id"),
+            AnimalType.valueOf(rs.getString("animal_type")),
+            rs.getBytes("image_binary"),
+            rs.getString("content_type"),
+            rs.getString("timestamp"),
+            rs.getString("source_website"));
+
+    private final JdbcTemplate jdbcTemplate;
+    private final RestTemplate restTemplate;
+
+    public PetPhotoService(JdbcTemplate jdbcTemplate, RestTemplate restTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+        this.restTemplate = restTemplate;
+    }
 
     /**
-     * ctor
-     * @param jdbcTemplate
+     * Fetches {@code count} photos of the given animal (a random animal per photo if {@code animal} is null)
+     * and saves them. All photos are downloaded before anything is saved, and saving happens in one
+     * transaction, so a failure never leaves a partial batch.
      */
-    public PetPhotoService(JdbcTemplate jdbcTemplate) {
-        this.jdbcTemplate = jdbcTemplate;
-    }
-    
-    @PostConstruct
-    public void initDatabase() {
-        try {
-            // Load schema.sql from src/main/resources/schema.sql
-            ClassPathResource resource = new ClassPathResource(SCHEMA_FILE);
-            
-            // Read the file contents into a String
-            String sqlScript = FileCopyUtils.copyToString(
-                new InputStreamReader(resource.getInputStream(), StandardCharsets.UTF_8)
-            );
-
-            // Execute the script against SQLite
-            jdbcTemplate.execute(sqlScript);
-            System.out.println("Successfully executed schema.sql on startup.");
-
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to initialize database from schema.sql", e);
+    @Transactional
+    public List<Photo> fetchAndSave(AnimalType animal, int count) {
+        List<Photo> fetched = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            AnimalType animalType = animal != null ? animal : randomAnimal();
+            fetched.add(fetchOne(animalType));
         }
+        List<Photo> saved = new ArrayList<>(count);
+        for (Photo photo : fetched) {
+            jdbcTemplate.update(INSERT_SQL, photo.animalType().name(), photo.imageBinary(), photo.contentType(),
+                    photo.timestamp(), photo.sourceWebsite());
+            long id = jdbcTemplate.queryForObject("SELECT last_insert_rowid()", Long.class);
+            saved.add(new Photo(id, photo.animalType(), photo.imageBinary(), photo.contentType(),
+                    photo.timestamp(), photo.sourceWebsite()));
+        }
+        return saved;
     }
 
-    public String fetchAndSaveRandomPhoto() {
-        byte[] imageBytes = null;
-        String successfulSource = "";
-
-        // Try downloading with error handling across options
-        while (true) {
-            String url = pickRandomUrl();
+    /** Tries each source once, in order, and gives up with a clear error instead of retrying forever. */
+    private Photo fetchOne(AnimalType animalType) {
+        List<String> templates = animalType.sourceTemplates();
+        String lastError = "";
+        for (String template : templates) {
+            String url = template.replace("{w}", String.valueOf(randomSize())).replace("{h}", String.valueOf(randomSize()));
             try {
-                imageBytes = restTemplate.getForObject(url, byte[].class);
-                if (imageBytes != null && imageBytes.length > 0) {
-                    successfulSource = url;
-                    break;
+                ResponseEntity<byte[]> response = restTemplate.getForEntity(url, byte[].class);
+                MediaType contentType = response.getHeaders().getContentType();
+                byte[] body = response.getBody();
+                if (contentType != null && "image".equals(contentType.getType()) && body != null && body.length > 0) {
+                    return new Photo(0, animalType, body, normalize(contentType), Instant.now().toString(), url);
                 }
-                System.err.println("url ok, but the fetched image is empty : 0 bytes");
-            } catch (Exception e) {
-                // Log and continue to the next website fallback
-                System.err.println("Failed to fetch from " + url + ", trying next...");
+                lastError = url + " did not return an image (content type: " + contentType + ")";
+            } catch (RestClientException e) {
+                lastError = url + " failed: " + e.getMessage();
             }
+            log.warn("{} photo source failed, trying next if available: {}", animalType, lastError);
         }
-        
-        String timestamp = Instant.now().toString();
-
-        // Save to SQLite embed database
-        jdbcTemplate.update(UPDATE_SQL, imageBytes, timestamp, successfulSource);
-
-        return successfulSource;
+        throw new PhotoFetchException("All " + templates.size() + " " + animalType + " photo source(s) failed. Last error: " + lastError);
     }
 
-    private String pickRandomUrl() {
-        Random random = new Random();
-        return candidateUrls.get(random.nextInt(candidateUrls.size()));
+    /** The latest saved photo, optionally of one animal. Database errors are not hidden as "not found". */
+    public Optional<Photo> getLatestPhoto(AnimalType animal) {
+        List<Photo> rows = animal == null
+                ? jdbcTemplate.query(SELECT_COLUMNS + "ORDER BY id DESC LIMIT 1", PHOTO_MAPPER)
+                : jdbcTemplate.query(SELECT_COLUMNS + "WHERE animal_type = ? ORDER BY id DESC LIMIT 1", PHOTO_MAPPER, animal.name());
+        return rows.stream().findFirst();
     }
 
-    public Map<String, Object> getLatestPhoto() {
-        try {
-            return jdbcTemplate.queryForObject(SELECT_SQL, (rs, rowNum) -> Map.of(
-                "timestamp", rs.getString("timestamp"),
-                "sourceWebsite", rs.getString("source_website"),
-                "imageBinary", rs.getBytes("image_binary")
-            ));
-        } catch (Exception e) {
-             // Table might be empty initially
-            return null;
-        }
+    public Optional<Photo> getPhoto(long id) {
+        return jdbcTemplate.query(SELECT_COLUMNS + "WHERE id = ?", PHOTO_MAPPER, id).stream().findFirst();
+    }
+
+    private static AnimalType randomAnimal() {
+        AnimalType[] animals = AnimalType.values();
+        return animals[ThreadLocalRandom.current().nextInt(animals.length)];
+    }
+
+    private static int randomSize() {
+        return ThreadLocalRandom.current().nextInt(MIN_SIZE, MAX_SIZE + 1);
+    }
+
+    /** Some sources send the non-standard "image/jpg"; store the standard "image/jpeg". */
+    private static String normalize(MediaType contentType) {
+        String value = contentType.getType() + "/" + contentType.getSubtype();
+        return "image/jpg".equalsIgnoreCase(value) ? MediaType.IMAGE_JPEG_VALUE : value;
     }
 }

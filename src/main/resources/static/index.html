@@ -5,36 +5,86 @@
     <title>Pet Microservice Dashboard</title>
     <style>
         body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; background: #f4f4f9; }
-        .card { background: white; padding: 20px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
-        img { max-width: 400px; height: auto; border-radius: 4px; margin-top: 15px; border: 1px solid #ddd; }
-        button { padding: 10px 20px; font-size: 16px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; }
+        .card { background: white; padding: 20px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 8px rgba(0,0,0,0.1); max-width: 900px; }
+        img { max-width: 400px; height: auto; border-radius: 4px; margin: 15px 5px 0; border: 1px solid #ddd; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; margin: 4px; }
         button:hover { background: #0056b3; }
+        select, input { padding: 8px; font-size: 16px; margin: 4px; }
+        .error { color: #b00020; }
     </style>
 </head>
 <body>
     <div class="card">
         <h2>Random Pet Photo Microservice</h2>
-        <button onclick="fetchNewPhoto()">Fetch New Random Photo</button>
-        <p id="meta"></p>
         <div>
-            <img id="photo" src="/api/photos/latest/image" alt="Latest Pet Photo" onerror="this.style.display='none'"/>
+            <label>Animal
+                <select id="animal">
+                    <option value="">Any (random)</option>
+                    <option value="cat">Cat</option>
+                    <option value="dog">Dog</option>
+                    <option value="bear">Bear</option>
+                </select>
+            </label>
+            <label>Count <input id="count" type="number" min="1" max="10" value="1" style="width: 60px"></label>
         </div>
+        <button id="fetch">Fetch New Random Photo</button>
+        <button id="latest">Show Latest Saved</button>
+        <p id="meta"></p>
+        <div id="photos"></div>
     </div>
 
     <script>
-        async function fetchNewPhoto() {
-            document.getElementById('meta').innerText = "Fetching from APIs and saving to SQLite...";
-            let res = await fetch('/api/photos/fetch', { method: 'POST' });
-            if(res.ok) {
-                let data = await res.json();
-                document.getElementById('meta').innerText = "Loaded from: " + data.source;
-                // Force image reload by updating cache-busting query param
-                document.getElementById('photo').style.display = 'block';
-                document.getElementById('photo').src = '/api/photos/latest/image?t=' + new Date().getTime();
-            } else {
-                document.getElementById('meta').innerText = "Error fetching photo.";
-            }
+        const metaEl = document.getElementById('meta');
+        const photosEl = document.getElementById('photos');
+        const animal = () => document.getElementById('animal').value;
+
+        function setMeta(text, isError) {
+            metaEl.textContent = text;
+            metaEl.className = isError ? 'error' : '';
         }
+
+        function showPhotos(photos) {
+            photosEl.replaceChildren(...photos.map(photo => {
+                const img = document.createElement('img');
+                img.src = photo.imageUrl;
+                img.alt = photo.animal.toLowerCase();
+                img.title = photo.animal.toLowerCase() + ' from ' + photo.sourceWebsite + ' at ' + photo.timestamp;
+                return img;
+            }));
+        }
+
+        async function errorText(res) {
+            try { return (await res.json()).detail || res.statusText; } catch { return res.statusText; }
+        }
+
+        document.getElementById('fetch').addEventListener('click', async () => {
+            const count = Number(document.getElementById('count').value);
+            setMeta('Fetching from APIs and saving to SQLite...');
+            const res = await fetch('/api/photos/fetch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ animal: animal() || null, count })
+            });
+            if (!res.ok) { setMeta('Error: ' + await errorText(res), true); return; }
+            const data = await res.json();
+            setMeta('Loaded ' + data.photos.length + ' photo(s) from: '
+                + [...new Set(data.photos.map(p => p.sourceWebsite.split('/')[2]))].join(', '));
+            showPhotos(data.photos);
+        });
+
+        document.getElementById('latest').addEventListener('click', async () => {
+            const query = animal() ? '?animal=' + animal() : '';
+            const res = await fetch('/api/photos/latest/meta' + query);
+            if (!res.ok) { setMeta('Error: ' + await errorText(res), true); photosEl.replaceChildren(); return; }
+            const photo = await res.json();
+            setMeta('Latest ' + photo.animal.toLowerCase() + ', from ' + photo.sourceWebsite + ' at ' + photo.timestamp);
+            showPhotos([photo]);
+        });
+
+        // Show the latest saved photo on page load, if there is one.
+        fetch('/api/photos/latest/meta').then(res => res.ok ? res.json() : null).then(photo => {
+            if (photo) { setMeta('Latest saved: ' + photo.animal.toLowerCase() + ' from ' + photo.sourceWebsite); showPhotos([photo]); }
+        });
     </script>
 </body>
 </html>

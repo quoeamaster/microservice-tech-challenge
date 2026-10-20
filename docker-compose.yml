@@ -1,0 +1,12 @@
+services:
+  app:
+    build: .
+    image: pet-photo-microservice:latest
+    ports:
+      - "9081:9081"
+    volumes:
+      - photo-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  photo-data:
